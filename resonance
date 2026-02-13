@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>PPG Prototype (Camera)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 18px; }
+    .card { max-width: 720px; margin: 0 auto; }
+    h1 { font-size: 22px; margin: 0 0 10px; }
+    p { margin: 10px 0; line-height: 1.35; }
+    .small { font-size: 13px; opacity: 0.85; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 12px 0; }
+    button { padding: 10px 14px; border: 0; border-radius: 10px; cursor: pointer; }
+    button.primary { background: #0ea5e9; color: white; }
+    button.secondary { background: #e5e7eb; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .pill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; background: #f3f4f6; border-radius: 999px; }
+    .dot { width: 10px; height: 10px; border-radius: 999px; background: #9ca3af; display: inline-block; }
+    .dot.ok { background: #22c55e; }
+    .dot.warn { background: #f59e0b; }
+    .dot.bad { background: #ef4444; }
+    .big { font-size: 42px; font-weight: 700; letter-spacing: -0.5px; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 640px) { .grid { grid-template-columns: 1fr 1fr; } }
+    canvas { width: 100%; height: 140px; background: #0b1220; border-radius: 12px; }
+    video { display: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Finger camera pulse prototype</h1>
+    <p class="small">Prototype only. Not a medical device.</p>
+
+    <div class="row">
+      <button id="startBtn" class="primary">Start camera</button>
+      <button id="stopBtn" class="secondary" disabled>Stop</button>
+      <button id="torchBtn" class="secondary" disabled>Try torch</button>
+      <span class="pill"><span id="sigDot" class="dot"></span><span id="sigText">signal: waiting</span></span>
+    </div>
+
+    <div class="grid">
+      <div>
+        <div class="small">Heart rate</div>
+        <div class="big"><span id="hrVal">--</span> <span class="small">bpm</span></div>
+        <div class="small">Peaks (recent): <span id="peakCount">0</span></div>
+      </div>
+      <div>
+        <div class="small">Tips</div>
+        <p class="small">
+          Use the rear camera. Cover lens fully with fingertip. Press gently, keep still.
+          Torch may work on some Android phones.
+        </p>
+      </div>
+    </div>
+
+    <p class="small">Waveform (green channel)</p>
+    <canvas id="plot" width="900" height="220"></canvas>
+
+    <video id="video" playsinline></video>
+    <canvas id="frame" width="160" height="120" style="display:none;"></canvas>
+
+    <p class="small">
+      iPhone: camera permissions require HTTPS. GitHub Pages is fine.
+    </p>
+  </div>
+
+<script>
+(() => {
+  // =========================================================
+  // CROSS-PAGE COMMS (matches breath page)
+  // =========================================================
+  const TPC_CHANNEL = "TPC_HRV_PROTO_V1";
+  const STORAGE_KEY = `${TPC_CHANNEL}:last`;
+  const bc = (typeof BroadcastChannel !== "undefined") ? new BroadcastChannel(TPC_CHANNEL) : null;
+
+  function safeJsonParse(str){ try { return JSON.parse(str); } catch { return null; } }
+  function isValidEnvelope(data){
+    return data && typeof data === "object" && data.channel === TPC_CHANNEL && typeof data.type === "string";
+  }
+  function publish(payload){
+    const envelope = { channel: TPC_CHANNEL, ...payload, ts: Date.now() };
+
+    if (bc) { try { bc.postMessage(envelope); } catch {} }
+    try { if (window.parent && window.parent !== window) window.parent.postMessage(envelope, "*"); } catch {}
+    try { if (window.opener && !window.opener.closed) window.opener.postMessage(envelope, "*"); } catch {}
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(envelope)); } catch {}
+  }
+  function subscribe(handler){
+    if (bc) bc.onmessage = (e) => { const d = e.data; if (isValidEnvelope(d)) handler(d); };
+
+    window.addEventListener("message", (event) => {
+      const d = event.data; if (isValidEnvelope(d)) handler(d);
+    });
+
+    window.addEventListener("storage", (e) => {
+      if (e.key !== STORAGE_KEY || !e.newValue) return;
+      const d = safeJsonParse(e.newValue);
+      if (isValidEnvelope(d)) handler(d);
+    });
+  }
+
+  // Receive breath phase (so we can tag beats as inhale/exhale/rest)
+  let lastBreathPhase = null;
+  subscribe((msg) => {
+    if (msg.type === "BREATH_PHASE") lastBreathPhase = msg.phase || null;
+  });
+
+  // =========================================================
+  // UI elements
+  // =========================================================
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn  = document.getElementById('stopBtn');
+  const torchBtn = document.getElementById('torchBtn');
+  const hrVal    = document.getElementById('hrVal');
+  const peakCountEl = document.getElementById('peakCount');
+
+  const sigDot  = document.getElementById('sigDot');
+  const sigText = document.getElementById('sigText');
+
+  const video = document.getElementById('video');
+  const frameCanvas = document.getElementById('frame');
+  const frameCtx = frameCanvas.getContext('2d', { willReadFrequently: true });
+
+  const plot = document.getElementById('plot');
+  const pctx = plot.getContext('2d');
+
+  let stream = null;
+  let track = null;
+  let rafId = null;
+
+  // Signal buffers
+  const fsTarget = 30;
+  const bufLen = 10 * fsTarget;
+  const sig = new Float32Array(bufLen);
+  let idx = 0;
+
+  // Peak detection
+  const peakTimes = [];
+  let lastPeakT = 0;
+  let lastAbove = false;
+
+  function meanStd(arr) {
+    let m = 0;
+    for (let i = 0; i < arr.length; i++) m += arr[i];
+    m /= arr.length;
+    let v = 0;
+    for (let i = 0; i < arr.length; i++) { const d = arr[i] - m; v += d*d; }
+    v /= arr.length;
+    return { mean: m, std: Math.sqrt(v) };
+  }
+
+  function setSignalStatus(level, text) {
+    sigDot.className = 'dot ' + level;
+    sigText.textContent = text;
+  }
+
+  function drawPlot() {
+    pctx.clearRect(0, 0, plot.width, plot.height);
+    pctx.fillStyle = '#0b1220';
+    pctx.fillRect(0, 0, plot.width, plot.height);
+
+    const ordered = new Float32Array(bufLen);
+    for (let i = 0; i < bufLen; i++) ordered[i] = sig[(idx + i) % bufLen];
+
+    const { mean, std } = meanStd(ordered);
+    const scale = std > 1e-6 ? (0.42 * plot.height / std) : 1;
+
+    pctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    pctx.beginPath();
+    pctx.moveTo(0, plot.height * 0.5);
+    pctx.lineTo(plot.width, plot.height * 0.5);
+    pctx.stroke();
+
+    pctx.strokeStyle = 'rgba(34,197,94,0.95)';
+    pctx.lineWidth = 2;
+    pctx.beginPath();
+    for (let x = 0; x < plot.width; x++) {
+      const i = Math.floor(x * (bufLen - 1) / (plot.width - 1));
+      const y = (plot.height * 0.5) - ((ordered[i] - mean) * scale);
+      if (x === 0) pctx.moveTo(x, y); else pctx.lineTo(x, y);
+    }
+    pctx.stroke();
+  }
+
+  function computeFrameAverages(frameData) {
+    let r = 0, g = 0, b = 0;
+    const n = frameData.length / 4;
+    for (let i = 0; i < frameData.length; i += 4) { r += frameData[i]; g += frameData[i+1]; b += frameData[i+2]; }
+    r /= n; g /= n; b /= n;
+    const brightness = (r + g + b) / 3;
+    const redness = r / (g + b + 1e-6);
+    return { brightness, redness, g };
+  }
+
+  function pushSample(v) { sig[idx] = v; idx = (idx + 1) % bufLen; }
+
+  // =========================================================
+  // NEW: publish IBI on each beat (this enables option 1 scoring)
+  // =========================================================
+  function publishBeat(ibiMs){
+    // ibiMs is time between beats in ms
+    if (!Number.isFinite(ibiMs) || ibiMs <= 0) return;
+    publish({
+      type: "PPG_IBI",
+      ibiMs: Math.round(ibiMs),
+      phase: lastBreathPhase || null
+    });
+  }
+
+  function detectPeaks() {
+    const ordered = new Float32Array(bufLen);
+    for (let i = 0; i < bufLen; i++) ordered[i] = sig[(idx + i) % bufLen];
+
+    const N = Math.min(bufLen, Math.floor(3 * fsTarget));
+    const tail = ordered.subarray(bufLen - N);
+    const { mean, std } = meanStd(tail);
+
+    const thr = mean + 0.6 * std;
+    const cur = ordered[bufLen - 1];
+    const now = performance.now();
+
+    const refractoryMs = 300;
+    const above = cur > thr;
+
+    if (!lastAbove && above && (now - lastPeakT) > refractoryMs) {
+      // peak detected
+      peakTimes.push(now);
+
+      // compute IBI and publish
+      if (lastPeakT > 0) {
+        const ibiMs = now - lastPeakT;
+        publishBeat(ibiMs);
+      }
+      lastPeakT = now;
+
+      const keepMs = 20000;
+      while (peakTimes.length && (now - peakTimes[0]) > keepMs) peakTimes.shift();
+    }
+    lastAbove = above;
+  }
+
+  function estimateHR() {
+    const now = performance.now();
+    const windowMs = 8000;
+    const recent = peakTimes.filter(t => (now - t) <= windowMs);
+    peakCountEl.textContent = String(recent.length);
+
+    if (recent.length < 2) { hrVal.textContent = '--'; return; }
+
+    const ibis = [];
+    for (let i = 1; i < recent.length; i++) ibis.push(recent[i] - recent[i - 1]);
+    const filtered = ibis.filter(ms => ms >= 300 && ms <= 2000);
+    if (filtered.length < 2) { hrVal.textContent = '--'; return; }
+
+    filtered.sort((a,b) => a-b);
+    const mid = Math.floor(filtered.length / 2);
+    const median = filtered.length % 2 ? filtered[mid] : (filtered[mid-1] + filtered[mid]) / 2;
+
+    const bpmRounded = Math.round(60000 / median);
+    hrVal.textContent = String(bpmRounded);
+  }
+
+  async function tryTorch(on) {
+    if (!track) return false;
+    try { await track.applyConstraints({ advanced: [{ torch: !!on }] }); return true; }
+    catch { return false; }
+  }
+
+  async function start() {
+    startBtn.disabled = true;
+    setSignalStatus('', 'signal: starting…');
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 } }
+      });
+
+      video.srcObject = stream;
+      await video.play();
+
+      track = stream.getVideoTracks()[0];
+      stopBtn.disabled = false;
+      torchBtn.disabled = false;
+
+      setSignalStatus('warn', 'signal: place finger on camera');
+
+      publish({ type: "PPG_READY" });
+      loop();
+    } catch (err) {
+      console.error(err);
+      setSignalStatus('bad', 'signal: camera blocked');
+      startBtn.disabled = false;
+      alert('Camera permission failed. Open in a normal tab and allow camera access.');
+    }
+  }
+
+  function stop() {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    track = null;
+
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    torchBtn.disabled = true;
+
+    hrVal.textContent = '--';
+    peakTimes.length = 0;
+    lastAbove = false;
+    lastPeakT = 0;
+
+    publish({ type: "PPG_IBI", ibiMs: null, phase: null });
+
+    peakCountEl.textContent = '0';
+    setSignalStatus('', 'signal: stopped');
+  }
+
+  function loop() {
+    const w = frameCanvas.width, h = frameCanvas.height;
+
+    frameCtx.drawImage(video, 0, 0, w, h);
+    const img = frameCtx.getImageData(0, 0, w, h);
+    const { brightness, redness, g } = computeFrameAverages(img.data);
+
+    pushSample(g);
+
+    const fingerLikely = (brightness < 140) && (redness > 1.05);
+
+    if (!fingerLikely) {
+      setSignalStatus('warn', 'signal: no finger detected');
+
+      peakTimes.length = 0;
+      lastAbove = false;
+      lastPeakT = 0;
+
+      hrVal.textContent = '--';
+      peakCountEl.textContent = '0';
+
+      publish({ type: "PPG_IBI", ibiMs: null, phase: null });
+
+      drawPlot();
+      rafId = requestAnimationFrame(loop);
+      return;
+    }
+
+    setSignalStatus('ok', 'signal: finger detected');
+
+    detectPeaks();
+    estimateHR();
+    drawPlot();
+
+    rafId = requestAnimationFrame(loop);
+  }
+
+  startBtn.addEventListener('click', start);
+  stopBtn.addEventListener('click', stop);
+
+  let torchOn = false;
+  torchBtn.addEventListener('click', async () => {
+    torchOn = !torchOn;
+    const ok = await tryTorch(torchOn);
+    if (!ok) {
+      torchOn = false;
+      alert('Torch not supported on this device/browser. Continue without torch.');
+    } else {
+      torchBtn.textContent = torchOn ? 'Torch on' : 'Try torch';
+    }
+  });
+})();
+</script>
+</body>
+</html>
