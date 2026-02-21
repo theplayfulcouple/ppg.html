@@ -280,8 +280,25 @@
       video.srcObject = stream;
       await video.play();
 
-      video.srcObject = stream;
-await video.play();
+      
+// 🔦 Force torch ON (best-effort, browser-dependent)
+try {
+  const track = stream.getVideoTracks()[0];
+  const caps = track.getCapabilities ? track.getCapabilities() : null;
+
+  // only try if the browser reports torch capability
+  if (caps && "torch" in caps) {
+    await track.applyConstraints({ advanced: [{ torch: true }] });
+
+    // keep your UI state consistent
+    torchOn = true;
+    torchBtn.disabled = false;
+    torchBtn.textContent = "Torch on";
+  }
+} catch (e) {
+  // torch not supported in this browser/device combo
+  // do nothing (avoid annoying alerts)
+}
 
 // 🔥 AUTO TORCH ON (HeartMath style)
 torchOn = true;
@@ -290,6 +307,7 @@ if (ok) {
   torchBtn.textContent = 'Torch on';
 }
 
+      
       track = stream.getVideoTracks()[0];
       stopBtn.disabled = false;
       torchBtn.disabled = false;
