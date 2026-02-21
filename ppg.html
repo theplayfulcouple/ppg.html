@@ -280,6 +280,16 @@
       video.srcObject = stream;
       await video.play();
 
+      video.srcObject = stream;
+await video.play();
+
+// 🔥 AUTO TORCH ON (HeartMath style)
+torchOn = true;
+const ok = await tryTorch(true);
+if (ok) {
+  torchBtn.textContent = 'Torch on';
+}
+
       track = stream.getVideoTracks()[0];
       stopBtn.disabled = false;
       torchBtn.disabled = false;
